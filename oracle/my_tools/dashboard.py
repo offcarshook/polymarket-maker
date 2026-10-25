@@ -288,10 +288,32 @@ def all_time_rows(root: Path) -> list[dict]:
     return sorted(rows, key=lambda r: float(r.get("fill_ts") or 0))
 
 
-def all_time_html(rows: list[dict]) -> str:
+def load_rewards(root: Path) -> dict:
+    try:
+        return json.loads((root / "my_tools/rewards_summary.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def rewards_table_html(rw: dict) -> str:
+    pm = sorted((rw.get("per_market") or {}).values(), key=lambda m: -float(m.get("usd") or 0))[:10]
+    if not pm:
+        return ""
+    body = "".join(f"<tr><td class='trunc'>{esc(m.get('q'))}</td><td class='pos'>${float(m.get('usd') or 0):.4f}</td>"
+                   f"<td>{float(m.get('share_now') or 0) * 100:.1f}%</td></tr>" for m in pm)
+    return ('<div class="panel" style="margin-bottom:16px"><h2>🎁 Top reward markets (estimate)</h2>'
+            '<div class="tbl"><table><tr><th>Market</th><th>Earned</th><th>Our share now</th></tr>'
+            f'{body}</table></div><div class="legend">Estimated from Polymarket\'s reward scoring vs the visible book. '
+            'Real payouts depend on everyone\'s orders over the day.</div></div>')
+
+
+def all_time_html(rows: list[dict], rw: dict | None = None) -> str:
+    rw = rw or {}
+    rewards = float(rw.get("total_usd") or 0)
     done = [r for r in rows if r["_pnl"] is not None]
     if not done:
-        return '<div class="panel" style="margin-bottom:16px"><h2>🏆 All-time</h2><div class="muted">No finished fills yet.</div></div>'
+        return ('<div class="panel" style="margin-bottom:16px"><h2>🏆 All-time</h2>'
+                f'<div class="muted">No finished fills yet · 🎁 est. rewards so far {usd(rewards)}</div></div>')
     total = sum(r["_pnl"] for r in done)
     stats = []
     for h, lbl in ((10, "+10s"), (60, "+1m"), (300, "+5m")):
@@ -317,7 +339,9 @@ def all_time_html(rows: list[dict]) -> str:
     chart = (f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" style="width:100%;height:120px;display:block">'
              f'<line x1="{pad}" x2="{w - pad}" y1="{y(0):.1f}" y2="{y(0):.1f}" stroke="var(--muted)" stroke-dasharray="3 3" stroke-width="1"/>'
              f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"/></svg>')
-    tiles = [("Fills (all runs)", f"{len(done)}"), ("PnL @ +5m", usd(total)),
+    tiles = [("Fills (all runs)", f"{len(done)}"), ("Trading PnL @ +5m", usd(total)),
+             ("🎁 Est. rewards", usd(rewards)), ("💰 Total (PnL + rewards)", usd(total + rewards)),
+             ("Rewards pace now", f"${float(rw.get('per_day_now_usd') or 0):,.2f}/day · {int(rw.get('markets_earning') or 0)} mkts"),
              ("Got picked off", f"{adverse * 100:.0f}%"),
              ("Best fill", usd(best["_pnl"])), ("Worst fill", usd(worst["_pnl"]))]
     tiles += [(f"Avg markout {lbl}", cents(v, True)) for lbl, v in stats]
@@ -459,7 +483,8 @@ td.trunc{{max-width:260px;overflow:hidden;text-overflow:ellipsis}}.pos{{color:va
 <header><div><h1>📈 Paper Market-Maker</h1><div class="sub">updated {time.strftime('%H:%M:%S UTC', time.gmtime(now))} · auto-refreshing · running {int(up // 60)}m · last feed event {f'{int(age)}s ago' if age is not None else '–'} · {st.requotes} requotes</div></div>
 <div style="display:flex;gap:6px"><span class="badge paper">PAPER · NO REAL ORDERS</span><span class="badge {status_cls}">{status_txt}</span></div></header>
 <div class="kpis">{kpi_html}</div>
-{all_time_html(all_time_rows(Path(".")))}
+{all_time_html(all_time_rows(Path(".")), load_rewards(Path(".")))}
+{rewards_table_html(load_rewards(Path(".")))}
 <div class="cards">{''.join(cards) or '<div class="card muted">No markets in config/markets.toml</div>'}</div>
 <div class="grid2">
  <div class="panel"><h2>Avg markout after fills</h2>{markout_chart(fills)}

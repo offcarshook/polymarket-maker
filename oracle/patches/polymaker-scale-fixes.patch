@@ -37,10 +37,36 @@ index 301290f..ad56dc3 100644
  
      async def resolve_tag_id(self, slug: str) -> str | None:
 diff --git a/src/polymaker/engine.py b/src/polymaker/engine.py
-index 12a105d..97b583d 100644
+index 12a105d..e1e6869 100644
 --- a/src/polymaker/engine.py
 +++ b/src/polymaker/engine.py
-@@ -279,6 +279,8 @@ class Engine:
+@@ -74,6 +74,7 @@ class Engine:
+         self._sweep: dict[str, bool] = {}
+         self._merging: set[str] = set()
+         self._token_cid: dict[str, str] = {}
++        self._paper_ahead: dict[str, float] = {}  # paper order id -> displayed size queued ahead
+         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
+         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
+         self._last_quote_fv: dict[str, float] = {}  # requote suppression
+@@ -123,6 +124,8 @@ class Engine:
+         self._spawn("reconcile", self._reconcile_loop)
+         self._spawn("metadata", self._metadata_refresh_loop)
+         self._spawn("maintenance", self._maintenance_loop)
++        if self.paper:
++            self._spawn("paper_books", self._paper_book_dump_loop)
+         for cid in self.metas:
+             self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
+         self._spawn("supervisor", self._supervise)
+@@ -256,6 +259,8 @@ class Engine:
+ 
+     # ── callbacks ───────────────────────────────────────────────────────
+     def _on_dirty(self, condition_id: str, token_id: str) -> None:
++        if self.paper:
++            self._paper_book_check(condition_id, token_id)
+         ev = self._dirty.get(condition_id)
+         if ev is not None:
+             ev.set()
+@@ -279,6 +284,8 @@ class Engine:
          cid = self._token_cid.get(tp.asset_id)
          if cid is None:
              return
@@ -49,43 +75,125 @@ index 12a105d..97b583d 100644
          p = self.profiles[cid]
          self.est[cid].flow.update(tp.aggressor, tp.size, tp.ts)
          # A trade only flags a SWEEP (-> pull quotes) if it's genuinely toxic:
-@@ -304,6 +306,35 @@ class Engine:
+@@ -304,6 +311,97 @@ class Engine:
          if consumed > 0 and tp.size >= p.event_sweep_frac * consumed:
              self._sweep[cid] = True
  
++    # ── paper fill simulator (PAPER ONLY) ───────────────────────────────
++    # Without this, paper mode never sees a fill and always believes it is flat,
++    # so position caps, inventory skew and the toxicity estimator never engage.
++    # A paper order rests virtually in the real book and fills when:
++    #   1. a print trades strictly THROUGH its price (all of it can fill);
++    #   2. a print trades AT its price against it, after the displayed size that
++    #      was queued ahead when we joined (price-time priority) is used up;
++    #   3. the book crosses it (best ask <= our bid): that aggressive order would
++    #      have matched our resting order first.
++    # Queue position only improves when the level empties (no cancel modelling).
++    async def _paper_book_dump_loop(self) -> None:
++        """PAPER ONLY: re-journal full books every 10 min so offline tools (markout,
++        rewards estimate) can rebuild complete depth after the journal is trimmed."""
++        while self._running:
++            await asyncio.sleep(600)
++            now = time.time()
++            for tok, book in list(self.md.books.items()):
++                self.journal.write("book", {
++                    "asset_id": tok, "source": "paper_dump",
++                    "bids": [{"price": p, "size": sz} for p, sz in book.bids.items()],
++                    "asks": [{"price": p, "size": sz} for p, sz in book.asks.items()],
++                }, now)
++
++    def _paper_level_size(self, token_id: str, side: Side, price: float) -> float:
++        book = self.md.books.get(token_id)
++        if book is None:
++            return float("inf")  # unknown queue: only trade-throughs/crosses fill
++        lvl = book.bids if side is Side.BUY else book.asks
++        return float(lvl.get(price, 0.0))
++
++    def _paper_apply(self, cid: str, o: Any, size: float, ts: float, why: str,
++                     print_px: float | None = None) -> None:
++        size = min(size, o.size)
++        if size <= 1e-9:
++            return
++        fill = Fill(o.token_id, o.side, o.price, size,
++                    trade_id=f"paper-{o.order_id}-{int(ts * 1000)}-{why}", ts=ts)
++        if self.state.apply_fill(fill):
++            self._on_fill(fill)
++            self.journal.write("paper_fills", {"order_id": o.order_id, "token_id": o.token_id,
++                                               "side": o.side.value, "price": o.price,
++                                               "size": size, "why": why, "print_px": print_px}, ts)
++            log.info("paper_fill", cid=cid[:8], side=o.side.value, price=o.price,
++                     size=round(size, 2), why=why)
++        o.size -= size
++        if o.size <= 1e-9:
++            self.state.remove_order(o.order_id)
++            self._paper_ahead.pop(o.order_id, None)
++        self._dirty[cid].set()  # requote with the new inventory
++
 +    def _paper_fill(self, cid: str, tp: TradePrint) -> None:
-+        """PAPER ONLY: simulate maker fills from public trade prints so inventory,
-+        position caps, inventory skew and the toxicity estimator behave like live
-+        (without this, paper mode never sees a fill and always believes it is flat).
-+        Conservative rule: a resting order fills only when a print trades strictly
-+        through its price; touching it doesn't count (no queue model)."""
 +        remaining = tp.size
-+        orders = sorted(self.state.orders_for(tp.asset_id), key=lambda o: o.price,
-+                        reverse=True)
-+        for o in orders:
-+            if remaining <= 0:
++        for o in sorted(self.state.orders_for(tp.asset_id), key=lambda o: o.price,
++                        reverse=True):
++            if remaining <= 1e-9:
 +                break
-+            through = tp.price < o.price if o.side is Side.BUY else tp.price > o.price
-+            if not through or o.size <= 0:
++            if o.size <= 0:
 +                continue
-+            take = min(remaining, o.size)
-+            remaining -= take
-+            fill = Fill(o.token_id, o.side, o.price, take,
-+                        trade_id=f"paper-{o.order_id}-{int(tp.ts * 1000)}", ts=tp.ts)
-+            if self.state.apply_fill(fill):
-+                self._on_fill(fill)
-+                log.info("paper_fill", cid=cid[:8], side=o.side.value, price=o.price,
-+                         size=round(take, 2), print_px=tp.price)
-+            o.size -= take
-+            if o.size <= 1e-9:
-+                self.state.remove_order(o.order_id)
-+        if remaining < tp.size:
-+            self._dirty[cid].set()  # requote with the new inventory
++            buy = o.side is Side.BUY
++            if (tp.price < o.price) if buy else (tp.price > o.price):
++                take = min(remaining, o.size)
++                remaining -= take
++                self._paper_apply(cid, o, take, tp.ts, "through", tp.price)
++            elif abs(tp.price - o.price) < 1e-9 and tp.aggressor is (Side.SELL if buy else Side.BUY):
++                ahead = self._paper_ahead.get(o.order_id, float("inf"))
++                eat = min(remaining, ahead)
++                ahead -= eat
++                remaining -= eat
++                self._paper_ahead[o.order_id] = ahead
++                if remaining > 1e-9 and ahead <= 1e-9:
++                    take = min(remaining, o.size)
++                    remaining -= take
++                    self._paper_apply(cid, o, take, tp.ts, "queue", tp.price)
++
++    def _paper_book_check(self, cid: str, token_id: str) -> None:
++        book = self.md.books.get(token_id)
++        if book is None or cid not in self._dirty:
++            return
++        now = time.time()
++        for o in list(self.state.orders_for(token_id)):
++            if o.side is Side.BUY:
++                opp = [(p, sz) for p, sz in book.asks.items() if p <= o.price + 1e-9]
++                own = book.bids
++            else:
++                opp = [(p, sz) for p, sz in book.bids.items() if p >= o.price - 1e-9]
++                own = book.asks
++            if opp:
++                self._paper_apply(cid, o, sum(sz for _, sz in opp), now, "crossed")
++            elif o.order_id in self._paper_ahead and own.get(o.price, 0.0) <= 0:
++                self._paper_ahead[o.order_id] = 0.0  # everyone ahead left the level
 +
      def _on_fill(self, fill: Fill) -> None:
          self.risk.note_fill(fill)
          cid = self._token_cid.get(fill.token_id)
-@@ -629,6 +660,8 @@ class Engine:
+@@ -489,6 +587,8 @@ class Engine:
+                 self.risk.note_order_result(len(placed) == len(plan.to_place))
+                 for o in placed:
+                     self.state.upsert_order(o)
++                    if self.paper:
++                        self._paper_ahead[o.order_id] = self._paper_level_size(o.token_id, o.side, o.price)
+                 if len(placed) < len(plan.to_place):
+                     # QUARANTINE: a failed/partial batch may still have posted
+                     # orders we don't have ids for. Cancel everything on these
+@@ -600,8 +700,8 @@ class Engine:
+                 # Hold the market lock so we don't race the quoter mid-flight.
+                 for cid, meta in self.metas.items():
+                     lock = self._locks.get(cid)
+-                    if lock is None:
+-                        continue
++                    if lock is None or self.gateway.funder == "0xPAPER":
++                        continue  # wallet-less paper: local orders are the truth
+                     async with lock:
+                         for tok in (meta.yes.token_id, meta.no.token_id):
+                             if self.state.inflight(tok) == 0:
+@@ -629,6 +729,8 @@ class Engine:
          authoritative (it's what the exchange settles), so we correct to it —
          but only for tokens with no in-flight trades (optimistic state is newer).
          """
@@ -94,6 +202,60 @@ index 12a105d..97b583d 100644
          tokens = [t for t in self._token_cid if self.state.inflight(t) == 0]
          onchain = await self.gateway.token_balances(tokens)
          if not onchain:
+diff --git a/src/polymaker/execution/gateway.py b/src/polymaker/execution/gateway.py
+index 54331d3..840b83f 100644
+--- a/src/polymaker/execution/gateway.py
++++ b/src/polymaker/execution/gateway.py
+@@ -57,6 +57,7 @@ class ExecutionGateway:
+         self._order_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
+         self._cancel_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
+         self._paper_ids = itertools.count(1)
++        self._paper_run = int(time.time())
+         self._hb_id: str = ""  # heartbeat chain
+         self._hb_failures: int = 0
+         # dedicated, bounded pool for blocking order/HTTP calls so a burst of
+@@ -155,7 +156,11 @@ class ExecutionGateway:
+         self._journal_write("orders_out", [asdict(q) for q in quotes], ts)
+ 
+         if self._paper:
+-            return [self._paper_order(q) for q in quotes]
++            orders = [self._paper_order(q) for q in quotes]
++            self._journal_write("paper_orders", [
++                {"id": o.order_id, "token_id": o.token_id, "side": o.side.value,
++                 "price": o.price, "size": o.size} for o in orders], ts)
++            return orders
+ 
+         def _place() -> list[OpenOrder]:
+             from py_clob_client_v2.clob_types import (
+@@ -183,7 +188,7 @@ class ExecutionGateway:
+             return []
+ 
+     def _paper_order(self, q: Quote) -> OpenOrder:
+-        oid = f"paper-{next(self._paper_ids)}"
++        oid = f"paper-{self._paper_run}-{next(self._paper_ids)}"  # unique across restarts
+         return OpenOrder(oid, q.token_id, q.side, q.price, q.size, OrderState.LIVE)
+ 
+     def _parse_place_response(self, resp: Any, quotes: list[Quote]) -> list[OpenOrder]:
+@@ -203,7 +208,10 @@ class ExecutionGateway:
+     async def cancel(self, order_ids: list[str]) -> bool:
+         """Cancel by id. Returns True on success — callers must NOT drop the
+         orders from local state on failure (they may still be live)."""
+-        if not order_ids or self._paper:
++        if not order_ids:
++            return True
++        if self._paper:
++            self._journal_write("paper_cancels", list(order_ids), time.time())
+             return True
+         await self._cancel_bucket.acquire(1)
+ 
+@@ -220,6 +228,7 @@ class ExecutionGateway:
+     async def cancel_asset(self, asset_id: str) -> bool:
+         """Cancel every order on one token (idempotent quarantine primitive)."""
+         if self._paper:
++            self._journal_write("paper_cancel_asset", asset_id, time.time())
+             return True
+ 
+         def _cancel() -> None:
 diff --git a/src/polymaker/marketdata/service.py b/src/polymaker/marketdata/service.py
 index 9ffd17a..d31de91 100644
 --- a/src/polymaker/marketdata/service.py
@@ -110,3 +272,58 @@ index 9ffd17a..d31de91 100644
          if self._proxy:
              kwargs["proxy"] = self._proxy
          async with websockets.connect(self._url, **kwargs) as ws:
+diff --git a/tests/test_paper_fills.py b/tests/test_paper_fills.py
+new file mode 100644
+index 0000000..dd00bc9
+--- /dev/null
++++ b/tests/test_paper_fills.py
+@@ -0,0 +1,49 @@
++"""Paper fill model: queue ahead, at-price prints, trade-through, book cross."""
++from polymaker.domain import OpenOrder, Side
++from polymaker.marketdata.orderbook import OrderBook
++from polymaker.marketdata.parse import TradePrint
++from tests.test_hardening2 import _engine_with_market
++
++
++def _setup(tmp_path, meta):
++    eng = _engine_with_market(tmp_path, meta)
++    eng.paper = True
++    tok = meta.yes.token_id
++    b = OrderBook()
++    b.apply_snapshot([(0.40, 100.0), (0.39, 50.0)], [(0.42, 80.0)], 0.0, None)
++    eng.md.books[tok] = b
++    o = OpenOrder("paper-0-1", tok, Side.BUY, 0.40, 50.0)
++    eng.state.upsert_order(o)
++    eng._paper_ahead[o.order_id] = eng._paper_level_size(tok, Side.BUY, 0.40)
++    return eng, tok, b
++
++
++def test_queue_then_fill(tmp_path, meta):
++    eng, tok, _ = _setup(tmp_path, meta)
++    cid = meta.condition_id
++    assert eng._paper_ahead["paper-0-1"] == 100.0
++    eng._on_trade(TradePrint(tok, cid, Side.SELL, 0.40, 60.0, 1.0))   # eats queue only
++    assert eng.state.position(tok).size == 0
++    eng._on_trade(TradePrint(tok, cid, Side.BUY, 0.40, 500.0, 1.5))   # wrong aggressor: ignored
++    assert eng.state.position(tok).size == 0
++    eng._on_trade(TradePrint(tok, cid, Side.SELL, 0.40, 70.0, 2.0))   # 40 queue, 30 to us
++    assert eng.state.position(tok).size == 30
++    eng._on_trade(TradePrint(tok, cid, Side.SELL, 0.38, 99.0, 3.0))   # through: last 20
++    assert eng.state.position(tok).size == 50
++    assert eng.state.orders_for(tok) == []
++
++
++def test_book_cross_fills(tmp_path, meta):
++    eng, tok, b = _setup(tmp_path, meta)
++    b.apply_delta(Side.SELL, 0.40, 25.0, 1.0)  # an ask lands on our bid price
++    eng._on_dirty(meta.condition_id, tok)
++    assert eng.state.position(tok).size == 25
++
++
++def test_level_emptied_moves_us_to_front(tmp_path, meta):
++    eng, tok, b = _setup(tmp_path, meta)
++    b.apply_delta(Side.BUY, 0.40, 0.0, 1.0)    # everyone ahead cancelled
++    eng._on_dirty(meta.condition_id, tok)
++    assert eng._paper_ahead["paper-0-1"] == 0.0
++    eng._on_trade(TradePrint(tok, meta.condition_id, Side.SELL, 0.40, 10.0, 2.0))
++    assert eng.state.position(tok).size == 10
