@@ -20,7 +20,10 @@ from datetime import datetime, timezone
 # single games / short in-play markets: whoever watches the game or the spot feed
 # sees the move before we can requote -> they were our biggest paper losses
 GAME_RE = re.compile(r"\bvs\.?\b|\bv\.\s|O/U|Over/Under|Spread|Handicap|Up or Down|"
-                     r"\bMap \d|\bGame \d|\bSet \d|\bRound \d|Total (Kills|Goals|Points)", re.I)
+                     r"\bMap \d|\bGame \d|\bSet \d|\bRound \d|Total (Kills|Goals|Points)|"
+                     r"\bwin on \d{4}-\d{2}-\d{2}|\bon \d{4}-\d{2}-\d{2}\?|\bdraw\b|\bend in a draw", re.I)
+# dated single-event slugs (one match / one day), e.g. "...-win-on-2026-10-25"
+DATED_SLUG_RE = re.compile(r"\d{4}-\d{2}-\d{2}$")
 
 
 def main() -> None:
@@ -64,7 +67,7 @@ def main() -> None:
                 continue
         if len(m.get("tokens", [])) != 2 or any(x in slug for x in a.exclude):
             continue
-        if a.no_games and GAME_RE.search(str(m.get("question", ""))):
+        if a.no_games and (GAME_RE.search(str(m.get("question", ""))) or DATED_SLUG_RE.search(slug)):
             continue
         tick_sz = float(m.get("tick_size") or 0.01)
         if a.max_spread_ticks and (ba - bb) > a.max_spread_ticks * tick_sz + 1e-9:

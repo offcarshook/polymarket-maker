@@ -37,10 +37,10 @@ index 301290f..ad56dc3 100644
  
      async def resolve_tag_id(self, slug: str) -> str | None:
 diff --git a/src/polymaker/config.py b/src/polymaker/config.py
-index 3f0af35..865f382 100644
+index 3f0af35..3afce74 100644
 --- a/src/polymaker/config.py
 +++ b/src/polymaker/config.py
-@@ -93,6 +93,14 @@ class StrategyProfile(BaseModel):
+@@ -93,6 +93,17 @@ class StrategyProfile(BaseModel):
      # multiplier on the market's reward min-size that reward-eligible orders are
      # bumped to (margin above the scoring floor). 1.5 => 100-share min -> 150.
      reward_size_mult: float = 1.0
@@ -52,17 +52,21 @@ index 3f0af35..865f382 100644
 +    # PAPER ONLY: cash budget for this profile's markets. Resting BUY orders lock
 +    # cash on Polymarket, so open buy notional + held inventory may not exceed it.
 +    paper_capital_usdc: float = 0.0
++    # after any fill on a token, place no new BUYs on it for this long (0 = off):
++    # stops re-buying into a one-way sweep. Exits (SELLs of held inventory) still go out.
++    fill_cooloff_s: float = 0.0
      # placement / churn
      reprice_ticks: int = 2
      resize_frac: float = 0.15
 diff --git a/src/polymaker/engine.py b/src/polymaker/engine.py
-index 12a105d..99638bb 100644
+index 12a105d..b11e280 100644
 --- a/src/polymaker/engine.py
 +++ b/src/polymaker/engine.py
-@@ -74,6 +74,10 @@ class Engine:
+@@ -74,6 +74,11 @@ class Engine:
          self._sweep: dict[str, bool] = {}
          self._merging: set[str] = set()
          self._token_cid: dict[str, str] = {}
++        self._last_fill_ts: dict[str, float] = {}  # token -> ts of our latest fill (fill cool-off)
 +        self._paper_ahead: dict[str, float] = {}  # paper order id -> displayed size queued ahead
 +        # paper order id -> {price: crossing size already matched}: a resting ask that
 +        # crossed us can only fill us once, but it stays in the real book (we aren't in it)
@@ -70,7 +74,7 @@ index 12a105d..99638bb 100644
          self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
          self._halted: set[str] = set()  # markets closed/resolved/not-accepting
          self._last_quote_fv: dict[str, float] = {}  # requote suppression
-@@ -123,6 +127,8 @@ class Engine:
+@@ -123,6 +128,8 @@ class Engine:
          self._spawn("reconcile", self._reconcile_loop)
          self._spawn("metadata", self._metadata_refresh_loop)
          self._spawn("maintenance", self._maintenance_loop)
@@ -79,7 +83,7 @@ index 12a105d..99638bb 100644
          for cid in self.metas:
              self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
          self._spawn("supervisor", self._supervise)
-@@ -256,6 +262,8 @@ class Engine:
+@@ -256,6 +263,8 @@ class Engine:
  
      # ── callbacks ───────────────────────────────────────────────────────
      def _on_dirty(self, condition_id: str, token_id: str) -> None:
@@ -88,7 +92,7 @@ index 12a105d..99638bb 100644
          ev = self._dirty.get(condition_id)
          if ev is not None:
              ev.set()
-@@ -279,6 +287,8 @@ class Engine:
+@@ -279,6 +288,8 @@ class Engine:
          cid = self._token_cid.get(tp.asset_id)
          if cid is None:
              return
@@ -97,7 +101,7 @@ index 12a105d..99638bb 100644
          p = self.profiles[cid]
          self.est[cid].flow.update(tp.aggressor, tp.size, tp.ts)
          # A trade only flags a SWEEP (-> pull quotes) if it's genuinely toxic:
-@@ -304,6 +314,141 @@ class Engine:
+@@ -304,7 +315,151 @@ class Engine:
          if consumed > 0 and tp.size >= p.event_sweep_frac * consumed:
              self._sweep[cid] = True
  
@@ -123,6 +127,14 @@ index 12a105d..99638bb 100644
 +                    "bids": [{"price": p, "size": sz} for p, sz in book.bids.items()],
 +                    "asks": [{"price": p, "size": sz} for p, sz in book.asks.items()],
 +                }, now)
++
++    def _fill_cooloff_trim(self, p: StrategyProfile, quotes: list[Any]) -> list[Any]:
++        """Drop new BUYs on tokens we were filled on within p.fill_cooloff_s."""
++        if p.fill_cooloff_s <= 0:
++            return quotes
++        now = time.time()
++        return [q for q in quotes
++                if q.side is not Side.BUY or now - self._last_fill_ts.get(q.token_id, 0.0) >= p.fill_cooloff_s]
 +
 +    def _paper_capital_trim(self, cid: str, p: StrategyProfile, quotes: list[Any]) -> list[Any]:
 +        """PAPER ONLY: keep this profile inside its cash budget. On Polymarket a
@@ -237,14 +249,17 @@ index 12a105d..99638bb 100644
 +                self._paper_ahead[o.order_id] = 0.0  # everyone ahead left the level
 +
      def _on_fill(self, fill: Fill) -> None:
++        self._last_fill_ts[fill.token_id] = max(self._last_fill_ts.get(fill.token_id, 0.0), fill.ts)
          self.risk.note_fill(fill)
          cid = self._token_cid.get(fill.token_id)
-@@ -484,12 +629,22 @@ class Engine:
+         if cid is None:
+@@ -484,12 +639,23 @@ class Engine:
                  log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                  self._dirty[cid].set()  # retry soon
              else:
 -                placed = await self.gateway.place(plan.to_place, meta)
-+                to_place = self._paper_capital_trim(cid, p, plan.to_place) if self.paper else plan.to_place
++                to_place = self._fill_cooloff_trim(p, plan.to_place)
++                to_place = self._paper_capital_trim(cid, p, to_place) if self.paper else to_place
 +                placed = await self.gateway.place(to_place, meta) if to_place else []
                  placed_n = len(placed)
 -                self.risk.note_order_result(len(placed) == len(plan.to_place))
@@ -265,7 +280,7 @@ index 12a105d..99638bb 100644
                      # QUARANTINE: a failed/partial batch may still have posted
                      # orders we don't have ids for. Cancel everything on these
                      # tokens (idempotent) and resync — never risk an untracked order.
-@@ -600,8 +755,8 @@ class Engine:
+@@ -600,8 +766,8 @@ class Engine:
                  # Hold the market lock so we don't race the quoter mid-flight.
                  for cid, meta in self.metas.items():
                      lock = self._locks.get(cid)
@@ -276,7 +291,7 @@ index 12a105d..99638bb 100644
                      async with lock:
                          for tok in (meta.yes.token_id, meta.no.token_id):
                              if self.state.inflight(tok) == 0:
-@@ -629,6 +784,8 @@ class Engine:
+@@ -629,6 +795,8 @@ class Engine:
          authoritative (it's what the exchange settles), so we correct to it —
          but only for tokens with no in-flight trades (optimistic state is newer).
          """
@@ -400,10 +415,10 @@ index fadc7e8..335922f 100644
  
 diff --git a/tests/test_paper_fills.py b/tests/test_paper_fills.py
 new file mode 100644
-index 0000000..33c4168
+index 0000000..b3c845d
 --- /dev/null
 +++ b/tests/test_paper_fills.py
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,127 @@
 +"""Paper fill model: queue ahead, at-price prints, trade-through, book cross."""
 +from polymaker.domain import OpenOrder, Side
 +from polymaker.marketdata.orderbook import OrderBook
@@ -514,3 +529,20 @@ index 0000000..33c4168
 +    o = OpenOrder("paper-0-9", tok, Side.BUY, 0.41, 20.0)
 +    assert eng._paper_would_cross(o)                 # would cross -> rejected
 +    assert not eng._paper_would_cross(OpenOrder("paper-0-8", tok, Side.BUY, 0.40, 20.0))
++
++
++def test_fill_cooloff_blocks_rebuying_but_not_exits(tmp_path, meta):
++    import time as _t
++    from polymaker.config import StrategyProfile
++    from polymaker.domain import Fill, Quote
++
++    eng = _engine_with_market(tmp_path, meta)
++    p = StrategyProfile(fill_cooloff_s=30.0)
++    tok = meta.yes.token_id
++    eng._on_fill(Fill(tok, Side.BUY, 0.40, 10.0, "f1", ts=_t.time()))
++    q = [Quote(tok, Side.BUY, 0.39, 10.0), Quote(tok, Side.SELL, 0.42, 10.0),
++         Quote(meta.no.token_id, Side.BUY, 0.58, 10.0)]
++    kept = eng._fill_cooloff_trim(p, q)
++    assert [x.side for x in kept if x.token_id == tok] == [Side.SELL]   # no re-buy, exit allowed
++    assert any(x.token_id == meta.no.token_id for x in kept)            # other side unaffected
++    assert eng._fill_cooloff_trim(StrategyProfile(), q) == q             # off by default

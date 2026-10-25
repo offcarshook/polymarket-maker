@@ -156,6 +156,8 @@ paper_capital_usdc  = 10000.0 # A/B: aggressive gets $10k fake cash (farming kee
 # market's reward band (score ~(1-0.6)^2 = 16% per share vs ~69% at the touch,
 # far fewer pick-offs), one order per side at the reward minimum, spread across
 # as many markets as $5k of fake cash can back.
+fill_cooloff_s      = 30.0    # no re-buying a token for 30s after a fill (stops buying into a sweep)
+
 [profiles.paper-rewards]
 micro_levels        = 3
 flow_ewma_halflife_s = 120

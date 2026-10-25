@@ -20,7 +20,10 @@ import sqlite3
 from datetime import datetime, timezone
 
 GAME_RE = re.compile(r"\bvs\.?\b|\bv\.\s|O/U|Over/Under|Spread|Handicap|Up or Down|"
-                     r"\bMap \d|\bGame \d|\bSet \d|\bRound \d|Total (Kills|Goals|Points)", re.I)
+                     r"\bMap \d|\bGame \d|\bSet \d|\bRound \d|Total (Kills|Goals|Points)|"
+                     r"\bwin on \d{4}-\d{2}-\d{2}|\bon \d{4}-\d{2}-\d{2}\?|\bdraw\b|\bend in a draw", re.I)
+# dated single-event slugs (one match / one day), e.g. "...-win-on-2026-10-25"
+DATED_SLUG_RE = re.compile(r"\d{4}-\d{2}-\d{2}$")
 
 
 def main() -> None:
@@ -52,7 +55,8 @@ def main() -> None:
         tick = float(m.get("tick_size") or 0.01)
         if not 0.10 <= mid <= 0.90 or (ba - bb) > a.max_spread_ticks * tick + 1e-9:
             continue
-        if GAME_RE.search(str(m.get("question", ""))) or any(x in slug for x in a.exclude):
+        if GAME_RE.search(str(m.get("question", ""))) or DATED_SLUG_RE.search(slug) \
+                or any(x in slug for x in a.exclude):
             continue
         end = m.get("end_date_iso")
         if end:
