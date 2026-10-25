@@ -126,30 +126,30 @@ flow_ewma_halflife_s = 60
 gamma               = 0.6   # lean harder to dump inventory (now that paper fills update it)
 delta_min_ticks     = 1       # quote right at the touch
 c_vol               = 0.8
-c_tox               = 2.5   # widen hard when recent fills got picked off (was 1.0)
+c_tox               = 1.0   # LOOSENED: widen less after pick-offs (was 2.5)
 vol_short_halflife_s = 10
 vol_long_halflife_s  = 900
 base_size_usdc      = 150.0 # $150 per side (was 500: one news fill = -$23)
 q_max_usdc          = 600.0 # net cap per market $600 (was 3000)
 q_soft_frac         = 0.5   # stop adding at $300 net
-layers              = 2     # 2 orders per side (was 3)
+layers              = 1     # 1 order per side so the cash covers ~30 busy markets
 reward_size_mult    = 1.0
 layer_step_ticks    = 1
 reprice_ticks       = 1
 resize_frac         = 0.2
-min_edge_ticks      = 1     # never bid at/above fair value (was 0: we paid up)
-event_cooloff_s     = 60    # stay out 60s after a jump (was 15)
-event_jump_ticks    = 4     # pull quotes on a 4-tick jump (was 10: we sat through moves)
-event_sweep_mult    = 4.0   # smaller sweeps count as events (was 8)
+min_edge_ticks      = 0     # join the best bid (was 1: sat 1 tick behind in 1c markets)
+event_cooloff_s     = 20    # LOOSENED: back in after 20s (was 60)
+event_jump_ticks    = 8     # LOOSENED: only pull on 8-tick jumps (was 4)
+event_sweep_mult    = 8.0   # LOOSENED: bigger prints needed to count as a sweep (was 4)
 event_sweep_frac    = 1.0
-trend_flow_z        = 2.0   # detect one-way flow sooner (was 3.0)
-trend_vol_ratio     = 2.5   # detect vol spikes sooner (was 5.0)
+trend_flow_z        = 3.0   # LOOSENED: slower to flag one-way flow (was 2.0)
+trend_vol_ratio     = 4.0   # LOOSENED: slower to flag vol spikes (was 2.5)
 end_date_taper_days = 3
 reduce_only_hours   = 12
 halt_before_hours   = 2
 exit_urgency_s      = 1800
 merge_min_size      = 20.0
-paper_capital_usdc  = 3000.0  # A/B: $3k of the $10k fake cash (resting buys lock cash)
+paper_capital_usdc  = 10000.0 # A/B: aggressive gets $10k fake cash (farming keeps $7k)
 
 
 # paper-rewards: PAPER ONLY reward farming. Rests ~60% of the way out in each
@@ -187,4 +187,4 @@ reduce_only_hours   = 24
 halt_before_hours   = 6
 exit_urgency_s      = 1800
 merge_min_size      = 20.0
-paper_capital_usdc  = 7000.0  # A/B: $7k of the $10k fake cash
+paper_capital_usdc  = 7000.0  # A/B: farming gets $7k fake cash

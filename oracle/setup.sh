@@ -22,10 +22,10 @@ REVIEWED_COMMIT="4f32103591c9582ccd012bdf10f77d86e5879444"
 RUN_USER="$(id -un)"
 MODE="${MODE:-full}"
 if [ "$MODE" = "lite" ]; then
-  PICK_ARGS="--agg-n 10 --farm-capital 7000"
+  PICK_ARGS="--agg-n 30 --agg-rank volume --farm-capital 7000"
   MAX_MB=200; DASH_EVERY=30; CPUQUOTA=50%; MEMMAX=700M
 else
-  PICK_ARGS="--agg-n 10 --farm-capital 7000"  # A/B is cash-limited, not CPU-limited
+  PICK_ARGS="--agg-n 30 --agg-rank volume --farm-capital 7000"  # A/B is cash-limited, not CPU-limited
   MAX_MB=1000; DASH_EVERY=15; CPUQUOTA=200%; MEMMAX=2G
 fi
 

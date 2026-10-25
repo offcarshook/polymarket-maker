@@ -56,18 +56,21 @@ index 3f0af35..865f382 100644
      reprice_ticks: int = 2
      resize_frac: float = 0.15
 diff --git a/src/polymaker/engine.py b/src/polymaker/engine.py
-index 12a105d..d6f5b93 100644
+index 12a105d..99638bb 100644
 --- a/src/polymaker/engine.py
 +++ b/src/polymaker/engine.py
-@@ -74,6 +74,7 @@ class Engine:
+@@ -74,6 +74,10 @@ class Engine:
          self._sweep: dict[str, bool] = {}
          self._merging: set[str] = set()
          self._token_cid: dict[str, str] = {}
 +        self._paper_ahead: dict[str, float] = {}  # paper order id -> displayed size queued ahead
++        # paper order id -> {price: crossing size already matched}: a resting ask that
++        # crossed us can only fill us once, but it stays in the real book (we aren't in it)
++        self._paper_cross_used: dict[str, dict[float, float]] = {}
          self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
          self._halted: set[str] = set()  # markets closed/resolved/not-accepting
          self._last_quote_fv: dict[str, float] = {}  # requote suppression
-@@ -123,6 +124,8 @@ class Engine:
+@@ -123,6 +127,8 @@ class Engine:
          self._spawn("reconcile", self._reconcile_loop)
          self._spawn("metadata", self._metadata_refresh_loop)
          self._spawn("maintenance", self._maintenance_loop)
@@ -76,7 +79,7 @@ index 12a105d..d6f5b93 100644
          for cid in self.metas:
              self._spawn(f"quote:{cid[:8]}", lambda c=cid: self._quoter(c))
          self._spawn("supervisor", self._supervise)
-@@ -256,6 +259,8 @@ class Engine:
+@@ -256,6 +262,8 @@ class Engine:
  
      # ── callbacks ───────────────────────────────────────────────────────
      def _on_dirty(self, condition_id: str, token_id: str) -> None:
@@ -85,7 +88,7 @@ index 12a105d..d6f5b93 100644
          ev = self._dirty.get(condition_id)
          if ev is not None:
              ev.set()
-@@ -279,6 +284,8 @@ class Engine:
+@@ -279,6 +287,8 @@ class Engine:
          cid = self._token_cid.get(tp.asset_id)
          if cid is None:
              return
@@ -94,7 +97,7 @@ index 12a105d..d6f5b93 100644
          p = self.profiles[cid]
          self.est[cid].flow.update(tp.aggressor, tp.size, tp.ts)
          # A trade only flags a SWEEP (-> pull quotes) if it's genuinely toxic:
-@@ -304,6 +311,122 @@ class Engine:
+@@ -304,6 +314,141 @@ class Engine:
          if consumed > 0 and tp.size >= p.event_sweep_frac * consumed:
              self._sweep[cid] = True
  
@@ -132,10 +135,11 @@ index 12a105d..d6f5b93 100644
 +            if p2 is not p:
 +                continue
 +            m2 = self.metas[c2]
-+            for tok in (m2.yes.token_id, m2.no.token_id):
++            py, pn = self.state.position(m2.yes.token_id), self.state.position(m2.no.token_id)
++            paired = max(min(py.size, pn.size), 0.0)  # YES+NO pairs merge back to $1: cash, not risk
++            for tok, pos in ((m2.yes.token_id, py), (m2.no.token_id, pn)):
 +                used += sum(o.price * o.size for o in self.state.orders_for(tok) if o.side is Side.BUY)
-+                pos = self.state.position(tok)
-+                used += max(pos.size, 0.0) * (pos.avg_price or 0.5)
++                used += max(pos.size - paired, 0.0) * (pos.avg_price or 0.5)
 +        keep = []
 +        for q in quotes:
 +            cost = q.price * q.size if q.side is Side.BUY else 0.0
@@ -145,6 +149,16 @@ index 12a105d..d6f5b93 100644
 +        if len(keep) < len(quotes):
 +            log.debug("paper_capital_trim", cid=cid[:8], dropped=len(quotes) - len(keep))
 +        return keep
++
++    def _paper_would_cross(self, o: Any) -> bool:
++        """PAPER ONLY: a post-only order priced at/through the opposite best is
++        rejected by the exchange, so it can never rest (or be 'crossed' into a fill)."""
++        book = self.md.books.get(o.token_id)
++        if book is None:
++            return False
++        if o.side is Side.BUY:
++            return any(p <= o.price + 1e-9 for p in book.asks.keys())
++        return any(p >= o.price - 1e-9 for p in book.bids.keys())
 +
 +    def _paper_level_size(self, token_id: str, side: Side, price: float) -> float:
 +        book = self.md.books.get(token_id)
@@ -171,6 +185,7 @@ index 12a105d..d6f5b93 100644
 +        if o.size <= 1e-9:
 +            self.state.remove_order(o.order_id)
 +            self._paper_ahead.pop(o.order_id, None)
++            self._paper_cross_used.pop(o.order_id, None)
 +        self._dirty[cid].set()  # requote with the new inventory
 +
 +    def _paper_fill(self, cid: str, tp: TradePrint) -> None:
@@ -210,14 +225,21 @@ index 12a105d..d6f5b93 100644
 +                opp = [(p, sz) for p, sz in book.bids.items() if p >= o.price - 1e-9]
 +                own = book.asks
 +            if opp:
-+                self._paper_apply(cid, o, sum(sz for _, sz in opp), now, "crossed")
++                used = self._paper_cross_used.setdefault(o.order_id, {})
++                fresh = 0.0
++                for px, sz in opp:
++                    avail = max(sz - used.get(px, 0.0), 0.0)
++                    fresh += avail
++                    used[px] = used.get(px, 0.0) + avail
++                if fresh > 1e-9:
++                    self._paper_apply(cid, o, fresh, now, "crossed")
 +            elif o.order_id in self._paper_ahead and own.get(o.price, 0.0) <= 0:
 +                self._paper_ahead[o.order_id] = 0.0  # everyone ahead left the level
 +
      def _on_fill(self, fill: Fill) -> None:
          self.risk.note_fill(fill)
          cid = self._token_cid.get(fill.token_id)
-@@ -484,12 +607,15 @@ class Engine:
+@@ -484,12 +629,22 @@ class Engine:
                  log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                  self._dirty[cid].set()  # retry soon
              else:
@@ -227,16 +249,23 @@ index 12a105d..d6f5b93 100644
                  placed_n = len(placed)
 -                self.risk.note_order_result(len(placed) == len(plan.to_place))
 +                self.risk.note_order_result(len(placed) == len(to_place))
++                rejected: list[str] = []
                  for o in placed:
++                    if self.paper and self._paper_would_cross(o):
++                        rejected.append(o.order_id)  # post-only would be rejected by the exchange
++                        continue
                      self.state.upsert_order(o)
 -                if len(placed) < len(plan.to_place):
 +                    if self.paper:
 +                        self._paper_ahead[o.order_id] = self._paper_level_size(o.token_id, o.side, o.price)
++                if rejected:
++                    await self.gateway.cancel(rejected)  # journals them so offline tools drop them too
++                    placed = [o for o in placed if o.order_id not in rejected]
 +                if len(placed) < len(to_place):
                      # QUARANTINE: a failed/partial batch may still have posted
                      # orders we don't have ids for. Cancel everything on these
                      # tokens (idempotent) and resync — never risk an untracked order.
-@@ -600,8 +726,8 @@ class Engine:
+@@ -600,8 +755,8 @@ class Engine:
                  # Hold the market lock so we don't race the quoter mid-flight.
                  for cid, meta in self.metas.items():
                      lock = self._locks.get(cid)
@@ -247,7 +276,7 @@ index 12a105d..d6f5b93 100644
                      async with lock:
                          for tok in (meta.yes.token_id, meta.no.token_id):
                              if self.state.inflight(tok) == 0:
-@@ -629,6 +755,8 @@ class Engine:
+@@ -629,6 +784,8 @@ class Engine:
          authoritative (it's what the exchange settles), so we correct to it —
          but only for tokens with no in-flight trades (optimistic state is newer).
          """
@@ -371,10 +400,10 @@ index fadc7e8..335922f 100644
  
 diff --git a/tests/test_paper_fills.py b/tests/test_paper_fills.py
 new file mode 100644
-index 0000000..2acee7e
+index 0000000..33c4168
 --- /dev/null
 +++ b/tests/test_paper_fills.py
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,110 @@
 +"""Paper fill model: queue ahead, at-price prints, trade-through, book cross."""
 +from polymaker.domain import OpenOrder, Side
 +from polymaker.marketdata.orderbook import OrderBook
@@ -415,6 +444,12 @@ index 0000000..2acee7e
 +    b.apply_delta(Side.SELL, 0.40, 25.0, 1.0)  # an ask lands on our bid price
 +    eng._on_dirty(meta.condition_id, tok)
 +    assert eng.state.position(tok).size == 25
++    eng._on_dirty(meta.condition_id, tok)      # same resting ask again: no double fill
++    eng._on_dirty(meta.condition_id, tok)
++    assert eng.state.position(tok).size == 25
++    b.apply_delta(Side.SELL, 0.40, 35.0, 2.0)  # 10 more shares arrive at that price
++    eng._on_dirty(meta.condition_id, tok)
++    assert eng.state.position(tok).size == 35
 +
 +
 +def test_level_emptied_moves_us_to_front(tmp_path, meta):
@@ -453,3 +488,29 @@ index 0000000..2acee7e
 +    quotes = [Quote(tok, Side.BUY, 0.40, 50.0), Quote(tok, Side.BUY, 0.39, 50.0)]  # $20 + $19.5
 +    kept = eng._paper_capital_trim(meta.condition_id, p, quotes)
 +    assert len(kept) == 1                      # 20 used + 20 = 40 fits, +19.5 would be 59.5
++
++
++def test_paired_yes_no_frees_paper_capital(tmp_path, meta):
++    """A YES+NO pair merges back to $1, so it must not tie up the paper budget."""
++    from polymaker.config import StrategyProfile
++    from polymaker.domain import Fill, Quote
++
++    eng = _engine_with_market(tmp_path, meta)
++    eng.paper = True
++    p = StrategyProfile(paper_capital_usdc=30.0)
++    eng.profiles[meta.condition_id] = p
++    eng.state.apply_fill(Fill(meta.yes.token_id, Side.BUY, 0.40, 100.0, "y1"))  # $40 YES
++    eng.state.apply_fill(Fill(meta.no.token_id, Side.BUY, 0.55, 100.0, "n1"))   # $55 NO
++    q = [Quote(meta.yes.token_id, Side.BUY, 0.40, 50.0)]                         # $20 new bid
++    assert eng._paper_capital_trim(meta.condition_id, p, q) == q  # 100 pairs = cash, not risk
++    eng.state.apply_fill(Fill(meta.yes.token_id, Side.BUY, 0.40, 50.0, "y2"))   # +50 unpaired YES = $20
++    assert eng._paper_capital_trim(meta.condition_id, p, q) == []  # 20 held + 20 new > 30
++
++
++def test_post_only_cross_is_rejected_not_filled(tmp_path, meta):
++    eng, tok, b = _setup(tmp_path, meta)
++    from polymaker.domain import OpenOrder
++    b.apply_delta(Side.SELL, 0.41, 50.0, 1.0)        # ask already at 0.41
++    o = OpenOrder("paper-0-9", tok, Side.BUY, 0.41, 20.0)
++    assert eng._paper_would_cross(o)                 # would cross -> rejected
++    assert not eng._paper_would_cross(OpenOrder("paper-0-8", tok, Side.BUY, 0.40, 20.0))

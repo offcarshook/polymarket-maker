@@ -26,6 +26,8 @@ GAME_RE = re.compile(r"\bvs\.?\b|\bv\.\s|O/U|Over/Under|Spread|Handicap|Up or Do
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--agg-n", type=int, default=15)
+    ap.add_argument("--agg-rank", choices=["opportunity", "volume"], default="opportunity",
+                    help="volume = busiest markets (most trade flow) with books <= 2 ticks wide")
     ap.add_argument("--farm-capital", type=float, default=5000.0)
     ap.add_argument("--size-mult", type=float, default=1.1, help="must match paper-rewards reward_size_mult")
     ap.add_argument("--min-rate", type=float, default=5.0, help="skip reward pools under $/day")
@@ -65,9 +67,13 @@ def main() -> None:
         opp = float(m.get("volume_24hr") or 0) * min(max(ba - bb, tick), 0.06) / 2 + rate
         # cash to rest one min-size bid on each side: YES ~mid + NO ~(1-mid) per share = ~$1/share
         cost = max(min_size, float(m.get("min_order_size") or 0)) * a.size_mult
-        rows.append({"slug": slug, "opp": opp, "rate": rate, "cost": cost, "q": m.get("question", "")})
+        rows.append({"slug": slug, "opp": opp, "rate": rate, "cost": cost, "q": m.get("question", ""),
+                     "vol": float(m.get("volume_24hr") or 0), "tight": (ba - bb) <= 2 * tick + 1e-9})
 
-    agg = sorted(rows, key=lambda r: -r["opp"])[: a.agg_n]
+    if a.agg_rank == "volume":
+        agg = sorted((r for r in rows if r["tight"]), key=lambda r: -r["vol"])[: a.agg_n]
+    else:
+        agg = sorted(rows, key=lambda r: -r["opp"])[: a.agg_n]
     taken = {r["slug"] for r in agg}
     farm_pool = [r for r in rows if r["slug"] not in taken and r["rate"] >= a.min_rate and r["cost"] > 0]
     farm_pool.sort(key=lambda r: -(r["rate"] / r["cost"]))  # reward $/day per $ locked
