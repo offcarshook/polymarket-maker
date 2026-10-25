@@ -36,8 +36,27 @@ index 301290f..ad56dc3 100644
          return out
  
      async def resolve_tag_id(self, slug: str) -> str | None:
+diff --git a/src/polymaker/config.py b/src/polymaker/config.py
+index 3f0af35..865f382 100644
+--- a/src/polymaker/config.py
++++ b/src/polymaker/config.py
+@@ -93,6 +93,14 @@ class StrategyProfile(BaseModel):
+     # multiplier on the market's reward min-size that reward-eligible orders are
+     # bumped to (margin above the scoring floor). 1.5 => 100-share min -> 150.
+     reward_size_mult: float = 1.0
++    # reward farming: in QUIET, rest at least this fraction of the reward band
++    # away from fair value (0 = off). Score ~ (1 - frac)^2, pick-off risk falls fast.
++    reward_band_frac: float = 0.0
++    # size every entry order at exactly the reward minimum (x reward_size_mult)
++    reward_min_sizing: bool = False
++    # PAPER ONLY: cash budget for this profile's markets. Resting BUY orders lock
++    # cash on Polymarket, so open buy notional + held inventory may not exceed it.
++    paper_capital_usdc: float = 0.0
+     # placement / churn
+     reprice_ticks: int = 2
+     resize_frac: float = 0.15
 diff --git a/src/polymaker/engine.py b/src/polymaker/engine.py
-index 12a105d..e1e6869 100644
+index 12a105d..d6f5b93 100644
 --- a/src/polymaker/engine.py
 +++ b/src/polymaker/engine.py
 @@ -74,6 +74,7 @@ class Engine:
@@ -75,7 +94,7 @@ index 12a105d..e1e6869 100644
          p = self.profiles[cid]
          self.est[cid].flow.update(tp.aggressor, tp.size, tp.ts)
          # A trade only flags a SWEEP (-> pull quotes) if it's genuinely toxic:
-@@ -304,6 +311,97 @@ class Engine:
+@@ -304,6 +311,122 @@ class Engine:
          if consumed > 0 and tp.size >= p.event_sweep_frac * consumed:
              self._sweep[cid] = True
  
@@ -101,6 +120,31 @@ index 12a105d..e1e6869 100644
 +                    "bids": [{"price": p, "size": sz} for p, sz in book.bids.items()],
 +                    "asks": [{"price": p, "size": sz} for p, sz in book.asks.items()],
 +                }, now)
++
++    def _paper_capital_trim(self, cid: str, p: StrategyProfile, quotes: list[Any]) -> list[Any]:
++        """PAPER ONLY: keep this profile inside its cash budget. On Polymarket a
++        resting BUY locks its notional, so (open buy notional + held inventory)
++        across every market on this profile may not exceed paper_capital_usdc."""
++        if p.paper_capital_usdc <= 0:
++            return quotes
++        used = 0.0
++        for c2, p2 in self.profiles.items():
++            if p2 is not p:
++                continue
++            m2 = self.metas[c2]
++            for tok in (m2.yes.token_id, m2.no.token_id):
++                used += sum(o.price * o.size for o in self.state.orders_for(tok) if o.side is Side.BUY)
++                pos = self.state.position(tok)
++                used += max(pos.size, 0.0) * (pos.avg_price or 0.5)
++        keep = []
++        for q in quotes:
++            cost = q.price * q.size if q.side is Side.BUY else 0.0
++            if used + cost <= p.paper_capital_usdc:
++                keep.append(q)
++                used += cost
++        if len(keep) < len(quotes):
++            log.debug("paper_capital_trim", cid=cid[:8], dropped=len(quotes) - len(keep))
++        return keep
 +
 +    def _paper_level_size(self, token_id: str, side: Side, price: float) -> float:
 +        book = self.md.books.get(token_id)
@@ -173,16 +217,26 @@ index 12a105d..e1e6869 100644
      def _on_fill(self, fill: Fill) -> None:
          self.risk.note_fill(fill)
          cid = self._token_cid.get(fill.token_id)
-@@ -489,6 +587,8 @@ class Engine:
-                 self.risk.note_order_result(len(placed) == len(plan.to_place))
+@@ -484,12 +607,15 @@ class Engine:
+                 log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
+                 self._dirty[cid].set()  # retry soon
+             else:
+-                placed = await self.gateway.place(plan.to_place, meta)
++                to_place = self._paper_capital_trim(cid, p, plan.to_place) if self.paper else plan.to_place
++                placed = await self.gateway.place(to_place, meta) if to_place else []
+                 placed_n = len(placed)
+-                self.risk.note_order_result(len(placed) == len(plan.to_place))
++                self.risk.note_order_result(len(placed) == len(to_place))
                  for o in placed:
                      self.state.upsert_order(o)
+-                if len(placed) < len(plan.to_place):
 +                    if self.paper:
 +                        self._paper_ahead[o.order_id] = self._paper_level_size(o.token_id, o.side, o.price)
-                 if len(placed) < len(plan.to_place):
++                if len(placed) < len(to_place):
                      # QUARANTINE: a failed/partial batch may still have posted
                      # orders we don't have ids for. Cancel everything on these
-@@ -600,8 +700,8 @@ class Engine:
+                     # tokens (idempotent) and resync — never risk an untracked order.
+@@ -600,8 +726,8 @@ class Engine:
                  # Hold the market lock so we don't race the quoter mid-flight.
                  for cid, meta in self.metas.items():
                      lock = self._locks.get(cid)
@@ -193,7 +247,7 @@ index 12a105d..e1e6869 100644
                      async with lock:
                          for tok in (meta.yes.token_id, meta.no.token_id):
                              if self.state.inflight(tok) == 0:
-@@ -629,6 +729,8 @@ class Engine:
+@@ -629,6 +755,8 @@ class Engine:
          authoritative (it's what the exchange settles), so we correct to it —
          but only for tokens with no in-flight trades (optimistic state is newer).
          """
@@ -272,12 +326,55 @@ index 9ffd17a..d31de91 100644
          if self._proxy:
              kwargs["proxy"] = self._proxy
          async with websockets.connect(self._url, **kwargs) as ws:
+diff --git a/src/polymaker/strategy/quoting.py b/src/polymaker/strategy/quoting.py
+index fadc7e8..335922f 100644
+--- a/src/polymaker/strategy/quoting.py
++++ b/src/polymaker/strategy/quoting.py
+@@ -84,6 +84,10 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
+     reward_band = m.rewards_max_spread / 100.0
+     if inp.regime == Regime.QUIET and reward_band > 0:
+         delta = _clamp(delta, base, max(base, reward_band))
++        if p.reward_band_frac > 0:  # farm: sit back from the touch, inside the band
++            delta = max(delta, min(p.reward_band_frac, 0.95) * reward_band)
++            if reward_band > tick:  # rounding to tick moves <= 1 tick: stay strictly inside
++                delta = min(delta, reward_band - tick)
+     delta = max(delta, tick)
+ 
+     r = inp.fv - skew
+@@ -99,12 +103,17 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
+     add_yes = inp.regime not in (Regime.REDUCE_ONLY,) and u < soft_cap
+     add_no = inp.regime not in (Regime.REDUCE_ONLY,) and u > -soft_cap
+ 
++    def entry_size(price: float, adj: float) -> float:
++        if p.reward_min_sizing and reward_floor > 0:
++            return round(reward_floor * p.layers * max(common_scale * adj, 0.0), 2)
++        return _size_shares(p.base_size_usdc, price, common_scale * adj, m)
++
+     # entry: BUY YES
+     if add_yes:
+         price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
+         if price is not None:
+             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
+-                        _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
++                        entry_size(price, 1 - max(u, 0.0)),
+                         p.layers, p.layer_step_ticks, down=True,
+                         exchange_min=m.min_order_size, reward_floor=reward_floor)
+ 
+@@ -114,7 +123,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
+         price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
+         if price is not None:
+             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
+-                        _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
++                        entry_size(price, 1 - max(-u, 0.0)),
+                         p.layers, p.layer_step_ticks, down=True,
+                         exchange_min=m.min_order_size, reward_floor=reward_floor)
+ 
 diff --git a/tests/test_paper_fills.py b/tests/test_paper_fills.py
 new file mode 100644
-index 0000000..dd00bc9
+index 0000000..2acee7e
 --- /dev/null
 +++ b/tests/test_paper_fills.py
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,78 @@
 +"""Paper fill model: queue ahead, at-price prints, trade-through, book cross."""
 +from polymaker.domain import OpenOrder, Side
 +from polymaker.marketdata.orderbook import OrderBook
@@ -327,3 +424,32 @@ index 0000000..dd00bc9
 +    assert eng._paper_ahead["paper-0-1"] == 0.0
 +    eng._on_trade(TradePrint(tok, meta.condition_id, Side.SELL, 0.40, 10.0, 2.0))
 +    assert eng.state.position(tok).size == 10
++
++
++# ── reward farming + paper capital budget ───────────────────────────────
++def test_reward_band_frac_sits_back_and_sizes_to_min(meta):
++    from polymaker.config import StrategyProfile
++    from polymaker.strategy.quoting import construct_quotes
++    from tests.test_quoting import _inputs
++
++    touch = construct_quotes(_inputs(meta, StrategyProfile())).quotes
++    farm = construct_quotes(_inputs(meta, StrategyProfile(
++        reward_band_frac=0.8, reward_min_sizing=True, layers=1))).quotes
++    yes = meta.yes.token_id
++    t_bid = max(q.price for q in touch if q.token_id == yes and q.side is Side.BUY)
++    f_bids = [q for q in farm if q.token_id == yes and q.side is Side.BUY]
++    assert f_bids and max(q.price for q in f_bids) <= t_bid         # never closer than default
++    assert 0.50 - min(q.price for q in f_bids) < 0.03 - 1e-9        # strictly inside the 3c band
++    assert all(q.size == meta.rewards_min_size for q in f_bids)     # exactly the reward min
++
++
++def test_paper_capital_trim_respects_budget(tmp_path, meta):
++    from polymaker.config import StrategyProfile
++    from polymaker.domain import Quote
++
++    eng, tok, _ = _setup(tmp_path, meta)       # one resting 0.40 x 50 = $20 order
++    p = StrategyProfile(paper_capital_usdc=50.0)
++    eng.profiles[meta.condition_id] = p
++    quotes = [Quote(tok, Side.BUY, 0.40, 50.0), Quote(tok, Side.BUY, 0.39, 50.0)]  # $20 + $19.5
++    kept = eng._paper_capital_trim(meta.condition_id, p, quotes)
++    assert len(kept) == 1                      # 20 used + 20 = 40 fits, +19.5 would be 59.5

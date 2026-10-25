@@ -149,3 +149,42 @@ reduce_only_hours   = 12
 halt_before_hours   = 2
 exit_urgency_s      = 1800
 merge_min_size      = 20.0
+paper_capital_usdc  = 3000.0  # A/B: $3k of the $10k fake cash (resting buys lock cash)
+
+
+# paper-rewards: PAPER ONLY reward farming. Rests ~60% of the way out in each
+# market's reward band (score ~(1-0.6)^2 = 16% per share vs ~69% at the touch,
+# far fewer pick-offs), one order per side at the reward minimum, spread across
+# as many markets as $5k of fake cash can back.
+[profiles.paper-rewards]
+micro_levels        = 3
+flow_ewma_halflife_s = 120
+gamma               = 0.6
+delta_min_ticks     = 1
+c_vol               = 1.5
+c_tox               = 2.5
+vol_short_halflife_s = 10
+vol_long_halflife_s  = 900
+base_size_usdc      = 25.0    # unused for entries (reward_min_sizing), kept for exits
+q_max_usdc          = 300.0
+q_soft_frac         = 0.5
+layers              = 1
+reward_size_mult    = 1.1     # 10% above the reward minimum so it always scores
+reward_band_frac    = 0.6
+reward_min_sizing   = true
+layer_step_ticks    = 1
+reprice_ticks       = 2
+resize_frac         = 0.3
+min_edge_ticks      = 1
+event_cooloff_s     = 60
+event_jump_ticks    = 4
+event_sweep_mult    = 4.0
+event_sweep_frac    = 1.0
+trend_flow_z        = 2.0
+trend_vol_ratio     = 2.5
+end_date_taper_days = 7
+reduce_only_hours   = 24
+halt_before_hours   = 6
+exit_urgency_s      = 1800
+merge_min_size      = 20.0
+paper_capital_usdc  = 7000.0  # A/B: $7k of the $10k fake cash

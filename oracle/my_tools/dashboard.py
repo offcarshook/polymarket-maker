@@ -307,6 +307,53 @@ def rewards_table_html(rw: dict) -> str:
             'Real payouts depend on everyone\'s orders over the day.</div></div>')
 
 
+def ab_html(root: Path, rows: list[dict], rw: dict) -> str:
+    """A/B scoreboard: paper-aggressive vs paper-rewards since my_tools/ab_start.txt."""
+    import tomllib
+    try:
+        start = float((root / "my_tools/ab_start.txt").read_text().strip())
+        mk = tomllib.loads((root / "config/markets.toml").read_text()).get("markets", [])
+        prof_cfg = tomllib.loads((root / "config/strategy.toml").read_text()).get("profiles", {})
+        c = sqlite3.connect(f"file:{root / 'state.db'}?mode=ro", uri=True)
+        slug_meta = {s_: (cid, json.loads(mj)) for cid, s_, mj in c.execute("select condition_id, slug, meta_json from markets")}
+    except (OSError, ValueError, sqlite3.Error):
+        return ""
+    arms: dict[str, dict] = {}
+    tok_arm: dict[str, str] = {}
+    for e in mk:
+        prof = e.get("profile", "?")
+        a = arms.setdefault(prof, {"cids": set(), "budget": float(prof_cfg.get(prof, {}).get("paper_capital_usdc") or 0)})
+        if e.get("slug") in slug_meta:
+            cid, meta = slug_meta[e["slug"]]
+            a["cids"].add(cid)
+            for t in meta.get("tokens", []):
+                tok_arm[t["token_id"]] = prof
+    if len(arms) < 2:
+        return ""
+    days = max((time.time() - start) / 86400, 1e-6)
+    pm = rw.get("per_market") or {}
+    head = "<tr><th></th>" + "".join(f"<th>{esc(n)}</th>" for n in arms) + "</tr>"
+    stats: dict[str, dict] = {}
+    for name, a in arms.items():
+        fills = [r for r in rows if tok_arm.get(r.get("token_id", "")) == name and float(r.get("fill_ts") or 0) >= start]
+        trade = sum(r["_pnl"] for r in fills if r["_pnl"] is not None)
+        rew = sum(float(pm.get(cid, {}).get("usd") or 0) for cid in a["cids"])
+        in_use = sum(float(pm.get(cid, {}).get("open_usd") or 0) for cid in a["cids"])
+        total = trade + rew
+        roc = (total / a["budget"] / days * 100) if a["budget"] else 0.0
+        stats[name] = {"Markets": f"{len(a['cids'])}", "Fake cash": f"${a['budget']:,.0f}",
+                       "Cash in orders now": f"${in_use:,.0f}", "Fills": f"{len(fills)}",
+                       "Trading PnL @ +5m": usd(trade), "🎁 Est. rewards": usd(rew),
+                       "💰 Total": usd(total), "Return on cash / day": f"{roc:+.2f}%"}
+    body = "".join("<tr><td class='lbl'>" + esc(k) + "</td>" + "".join(f"<td>{esc(stats[n][k])}</td>" for n in arms) + "</tr>"
+                   for k in next(iter(stats.values())))
+    since = time.strftime("%b %d %H:%M", time.gmtime(start))
+    return (f'<div class="panel" style="margin-bottom:16px"><h2>🥊 A/B test since {esc(since)} UTC '
+            f'({days * 24:.1f} h)</h2><div class="tbl"><table>{head}{body}</table></div>'
+            '<div class="legend">Fair comparison = return on cash per day. Fills count once their 5-min markout '
+            'is in. Rewards are estimates.</div></div>')
+
+
 def all_time_html(rows: list[dict], rw: dict | None = None) -> str:
     rw = rw or {}
     rewards = float(rw.get("total_usd") or 0)
@@ -483,6 +530,7 @@ td.trunc{{max-width:260px;overflow:hidden;text-overflow:ellipsis}}.pos{{color:va
 <header><div><h1>📈 Paper Market-Maker</h1><div class="sub">updated {time.strftime('%H:%M:%S UTC', time.gmtime(now))} · auto-refreshing · running {int(up // 60)}m · last feed event {f'{int(age)}s ago' if age is not None else '–'} · {st.requotes} requotes</div></div>
 <div style="display:flex;gap:6px"><span class="badge paper">PAPER · NO REAL ORDERS</span><span class="badge {status_cls}">{status_txt}</span></div></header>
 <div class="kpis">{kpi_html}</div>
+{ab_html(Path("."), all_time_rows(Path(".")), load_rewards(Path(".")))}
 {all_time_html(all_time_rows(Path(".")), load_rewards(Path(".")))}
 {rewards_table_html(load_rewards(Path(".")))}
 <div class="cards">{''.join(cards) or '<div class="card muted">No markets in config/markets.toml</div>'}</div>

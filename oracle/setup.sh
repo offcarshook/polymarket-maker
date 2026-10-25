@@ -22,10 +22,10 @@ REVIEWED_COMMIT="4f32103591c9582ccd012bdf10f77d86e5879444"
 RUN_USER="$(id -un)"
 MODE="${MODE:-full}"
 if [ "$MODE" = "lite" ]; then
-  PICK_ARGS="--n 300 --min-hours-left 336 --max-spread-ticks 3 --no-games"
+  PICK_ARGS="--agg-n 10 --farm-capital 7000"
   MAX_MB=200; DASH_EVERY=30; CPUQUOTA=50%; MEMMAX=700M
 else
-  PICK_ARGS="--n 100000 --min-hours-left 48 --max-spread-ticks 3 --no-games"
+  PICK_ARGS="--agg-n 10 --farm-capital 7000"  # A/B is cash-limited, not CPU-limited
   MAX_MB=1000; DASH_EVERY=15; CPUQUOTA=200%; MEMMAX=2G
 fi
 
@@ -76,7 +76,8 @@ say "5/7 python deps"
 say "6/7 market scan + pick (takes ~1-3 min)"
 "$UV" run python my_tools/scan_tags.py
 # shellcheck disable=SC2086
-.venv/bin/python -I my_tools/pick_markets.py $PICK_ARGS
+.venv/bin/python -I my_tools/ab_pick.py $PICK_ARGS   # A/B: aggressive vs reward farming
+[ -f my_tools/ab_start.txt ] || date +%s > my_tools/ab_start.txt
 
 say "7/7 systemd services (mode: $MODE)"
 for f in "$KIT"/systemd/*; do

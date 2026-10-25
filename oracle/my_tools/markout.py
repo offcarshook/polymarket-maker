@@ -230,7 +230,11 @@ class Sim:
             if cid:
                 mine.setdefault(cid, []).append(o)
         earned_now, earning = 0.0, 0
+        for pm in self.rw["per_market"].values():
+            pm["open_usd"] = 0.0
         for cid, orders in mine.items():
+            pm = self.rw["per_market"].setdefault(cid, {"q": self.markets[cid]["q"][:70], "usd": 0.0})
+            pm["open_usd"] = round(sum(o.price * o.size for o in orders if o.side == "BUY"), 2)
             m = self.markets[cid]
             v, rate, min_size = m["v"], m["rate"], m["min_size"]
             book = self.books.get(m["yes"])
@@ -252,7 +256,6 @@ class Sim:
             usd = rate / 1440.0 * share * minutes
             earned_now += usd
             earning += 1
-            pm = self.rw["per_market"].setdefault(cid, {"q": m["q"][:70], "usd": 0.0})
             pm["usd"] = round(pm["usd"] + usd, 6)
             pm["share_now"] = round(share, 4)
         self.rw["total_usd"] = round(float(self.rw.get("total_usd") or 0) + earned_now, 6)
