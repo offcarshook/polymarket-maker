@@ -1,0 +1,6 @@
+# Copy this file to C:\Users\<YOU>\.wslconfig  (no .txt), then run:  wsl --shutdown
+# Caps how much of your PC the whole WSL VM may use.
+[wsl2]
+memory=1536MB
+processors=2
+swap=1GB

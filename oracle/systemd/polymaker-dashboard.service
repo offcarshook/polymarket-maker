@@ -1,12 +1,13 @@
 [Unit]
-Description=polymaker dashboard writer (web/index.html every 15s)
+Description=polymaker dashboard writer (web/index.html)
 After=polymaker-paper.service
 
 [Service]
 User=@USER@
 WorkingDirectory=@APP@
-ExecStart=@APP@/.venv/bin/python -I my_tools/dashboard.py --out web/index.html
+ExecStart=@APP@/.venv/bin/python -I my_tools/dashboard.py --out web/index.html --every @DASH_EVERY@
 Restart=always
+Nice=15
 RestartSec=10
 
 [Install]

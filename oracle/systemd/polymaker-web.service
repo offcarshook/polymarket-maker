@@ -7,6 +7,7 @@ WorkingDirectory=@APP@
 # 127.0.0.1 only: reach it through Tailscale serve or an SSH tunnel, never the open internet
 ExecStart=@APP@/.venv/bin/python -m http.server 8080 --bind 127.0.0.1 --directory web
 Restart=always
+Nice=15
 RestartSec=5
 
 [Install]

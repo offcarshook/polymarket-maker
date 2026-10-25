@@ -4,8 +4,10 @@ Description=keep journal/paper.jsonl under 1 GB
 [Service]
 User=@USER@
 WorkingDirectory=@APP@
+Environment=MAX_MB=@MAX_MB@
 ExecStart=@APP@/my_tools/journal_guard.sh
 Restart=always
+Nice=15
 RestartSec=10
 
 [Install]

@@ -10,6 +10,9 @@ WorkingDirectory=@APP@
 ExecStartPre=/bin/sh -c 'if grep -qE "^PK=.+" @APP@/.env; then echo "PK is set in .env - refusing (paper test only)"; exit 1; fi'
 ExecStart=@UV@ run polymaker run --paper
 Restart=always
+Nice=10
+CPUQuota=@CPUQUOTA@
+MemoryMax=@MEMMAX@
 RestartSec=10
 
 [Install]

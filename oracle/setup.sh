@@ -4,7 +4,8 @@
 #
 #   git clone https://github.com/offcarshook/polymarket-maker
 #   cd polymarket-maker && git checkout claude/magical-ritchie-b6wz2p
-#   bash oracle/setup.sh
+#   bash oracle/setup.sh                 # full: ~2000+ markets (Oracle / a spare server)
+#   MODE=lite bash oracle/setup.sh       # lite: 300 selected markets, capped CPU/RAM (your PC / WSL)
 #
 # What it does:
 #   * installs git/curl + uv (Python manager)
@@ -19,6 +20,19 @@ KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="${APP_DIR:-$HOME/poly-maker}"
 REVIEWED_COMMIT="4f32103591c9582ccd012bdf10f77d86e5879444"
 RUN_USER="$(id -un)"
+MODE="${MODE:-full}"
+if [ "$MODE" = "lite" ]; then
+  PICK_ARGS="--n 300 --min-hours-left 336 --max-spread-ticks 3"
+  MAX_MB=200; DASH_EVERY=30; CPUQUOTA=50%; MEMMAX=700M
+else
+  PICK_ARGS="--n 100000 --min-hours-left 48 --max-spread-ticks 3"
+  MAX_MB=1000; DASH_EVERY=15; CPUQUOTA=200%; MEMMAX=2G
+fi
+
+if [ "$(ps -p 1 -o comm= 2>/dev/null)" != "systemd" ]; then
+  echo "systemd is not running (on WSL: see oracle/WINDOWS_SETUP.md step 2, then 'wsl --shutdown' and reopen)."
+  exit 1
+fi
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
@@ -61,11 +75,14 @@ say "5/7 python deps"
 
 say "6/7 market scan + pick (takes ~1-3 min)"
 "$UV" run python my_tools/scan_tags.py
-.venv/bin/python -I my_tools/pick_markets.py --n 100000 --min-hours-left 48 --max-spread-ticks 3
+# shellcheck disable=SC2086
+.venv/bin/python -I my_tools/pick_markets.py $PICK_ARGS
 
-say "7/7 systemd services"
+say "7/7 systemd services (mode: $MODE)"
 for f in "$KIT"/systemd/*; do
-  sed -e "s#@APP@#$APP#g" -e "s#@USER@#$RUN_USER#g" -e "s#@UV@#$UV#g" "$f" \
+  sed -e "s#@APP@#$APP#g" -e "s#@USER@#$RUN_USER#g" -e "s#@UV@#$UV#g" \
+      -e "s#@PICK_ARGS@#$PICK_ARGS#g" -e "s#@MAX_MB@#$MAX_MB#g" -e "s#@DASH_EVERY@#$DASH_EVERY#g" \
+      -e "s#@CPUQUOTA@#$CPUQUOTA#g" -e "s#@MEMMAX@#$MEMMAX#g" "$f" \
     | sudo tee "/etc/systemd/system/$(basename "$f")" >/dev/null
 done
 sudo systemctl daemon-reload
@@ -80,7 +97,8 @@ cat <<EOF
 
 ✅ Done. Everything runs 24/7 and restarts itself after crashes/reboots.
    Dashboard (private, on the server only): http://127.0.0.1:8080
-   See it from your laptop/phone -> oracle/ORACLE_SETUP.md, step 6.
+   Windows/WSL: just open http://localhost:8080 in your browser.
+   Oracle: see oracle/ORACLE_SETUP.md, step 6.
    Logs:   journalctl -u polymaker-paper -f
    Stop:   sudo systemctl stop 'polymaker-*'
 EOF
