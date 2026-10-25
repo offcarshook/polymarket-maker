@@ -184,6 +184,10 @@ def esc(s: object) -> str:
     return html.escape(str(s))
 
 
+def usd(x: float) -> str:
+    return f"{'−' if x < 0 else '+'}${abs(x):.2f}"
+
+
 def cents(x: float | None, signed: bool = False) -> str:
     if x is None:
         return "–"
@@ -261,6 +265,68 @@ def big_losses_html(path: Path, names: dict[str, dict]) -> str:
     return "".join(out)
 
 
+def all_time_rows(root: Path) -> list[dict]:
+    """Every finished fill across all runs (archived + current), deduped, oldest first."""
+    files = sorted((root / "my_tools/archive").glob("*markout.csv")) + [root / "my_tools/markout.csv"]
+    seen: set[tuple] = set()
+    rows: list[dict] = []
+    for f in files:
+        if not f.exists():
+            continue
+        with f.open() as fh:
+            for r in csv.DictReader(fh):
+                k = (r.get("fill_ts"), r.get("token_id"), r.get("fill_price"))
+                if k in seen:
+                    continue
+                seen.add(k)
+                pnl = fnum(r.get("pnl_300s_usd"))
+                if pnl is None:
+                    mk, sz = fnum(r.get("markout_300s")), fnum(r.get("fill_size"))
+                    pnl = mk * sz if mk is not None and sz is not None else None
+                r["_pnl"] = pnl
+                rows.append(r)
+    return sorted(rows, key=lambda r: float(r.get("fill_ts") or 0))
+
+
+def all_time_html(rows: list[dict]) -> str:
+    done = [r for r in rows if r["_pnl"] is not None]
+    if not done:
+        return '<div class="panel" style="margin-bottom:16px"><h2>🏆 All-time</h2><div class="muted">No finished fills yet.</div></div>'
+    total = sum(r["_pnl"] for r in done)
+    stats = []
+    for h, lbl in ((10, "+10s"), (60, "+1m"), (300, "+5m")):
+        v = [x for x in (fnum(r.get(f"markout_{h}s")) for r in done) if x is not None]
+        stats.append((lbl, sum(v) / len(v) if v else None))
+    adverse = sum(1 for r in done if r["_pnl"] < 0) / len(done)
+    worst = min(done, key=lambda r: r["_pnl"])
+    best = max(done, key=lambda r: r["_pnl"])
+    first = time.strftime("%b %d %H:%M", time.gmtime(float(done[0]["fill_ts"])))
+    # cumulative PnL line
+    w, h, pad = 640, 120, 6
+    cum, pts = 0.0, []
+    for r in done:
+        cum += r["_pnl"]
+        pts.append(cum)
+    lo, hi = min(pts + [0.0]), max(pts + [0.0])
+    if hi - lo < 1:
+        lo, hi = lo - 0.5, hi + 0.5
+    y = lambda v: h - pad - (v - lo) / (hi - lo) * (h - 2 * pad)  # noqa: E731
+    x = lambda i: pad + i / max(len(pts) - 1, 1) * (w - 2 * pad)  # noqa: E731
+    path = " ".join(f"{'M' if i == 0 else 'L'}{x(i):.1f},{y(v):.1f}" for i, v in enumerate(pts))
+    color = "var(--pos)" if total >= 0 else "var(--neg)"
+    chart = (f'<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" style="width:100%;height:120px;display:block">'
+             f'<line x1="{pad}" x2="{w - pad}" y1="{y(0):.1f}" y2="{y(0):.1f}" stroke="var(--muted)" stroke-dasharray="3 3" stroke-width="1"/>'
+             f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"/></svg>')
+    tiles = [("Fills (all runs)", f"{len(done)}"), ("PnL @ +5m", usd(total)),
+             ("Got picked off", f"{adverse * 100:.0f}%"),
+             ("Best fill", usd(best["_pnl"])), ("Worst fill", usd(worst["_pnl"]))]
+    tiles += [(f"Avg markout {lbl}", cents(v, True)) for lbl, v in stats]
+    tile_html = "".join(f'<div class="kpi"><div class="kpi-l">{esc(a)}</div><div class="kpi-v" style="font-size:18px">{esc(b)}</div></div>' for a, b in tiles)
+    return (f'<div class="panel" style="margin-bottom:16px"><h2>🏆 All-time · every run since {esc(first)} UTC</h2>'
+            f'<div class="kpis" style="margin-bottom:10px">{tile_html}</div>'
+            f'<div class="lbl">Cumulative PnL after 5 min, fill by fill</div>{chart}</div>')
+
+
 def render(st: State, names: dict[str, dict], cids: list[str], fills: list[dict]) -> str:
     now = time.time()
     quoting = sum(1 for c in cids if any(t["token_id"] in st.quotes for t in names.get(c, {}).get("tokens", [])))
@@ -286,7 +352,7 @@ def render(st: State, names: dict[str, dict], cids: list[str], fills: list[dict]
 
     kpis = [
         ("Simulated fills", f"{len(fills)}", "trade-through only"),
-        ("Paper PnL (mark-to-mid)", f"${pnl:+.2f}", "if held to now"),
+        ("Paper PnL (mark-to-mid)", usd(pnl), "if held to now"),
         ("Adverse @ +5m", f"{adverse * 100:.0f}%" if adverse is not None else "–", "fills that moved against us"),
         ("Trades watched", f"{st.trades_seen}", f"{st.quotes_sent} paper quotes sent"),
         ("Markets", f"{len(cids)}", f"{quoting} quoting now · top 50 shown"),
@@ -357,17 +423,17 @@ def render(st: State, names: dict[str, dict], cids: list[str], fills: list[dict]
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="15">
 <title>Paper MM Dashboard</title><style>
 :root{{--bg:#f6f7f9;--card:#fff;--ink:#14161a;--muted:#6b7280;--line:#e5e7eb;--pos:#0f9d58;--neg:#d93025;--bid:#1a73e8;--ask:#e8710a;--warn:#f9ab00}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#0e1013;--card:#171a1f;--ink:#e8eaed;--muted:#9aa0a6;--line:#2a2f36;--pos:#34d399;--neg:#f87171;--bid:#60a5fa;--ask:#fb923c;--warn:#fbbf24}}}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#0e1013;--card:#171a1f;--ink:#e8eaed;--muted:#9aa0a6;--line:#2a2f36;--pos:#34d399;--neg:#f87171;--bid:#60a5fa;--ask:#fb923c;--warn:#fbbf24}}}}:root[data-theme="dark"]{{--bg:#0e1013;--card:#171a1f;--ink:#e8eaed;--muted:#9aa0a6;--line:#2a2f36;--pos:#34d399;--neg:#f87171;--bid:#60a5fa;--ask:#fb923c;--warn:#fbbf24}}
 *{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
 .wrap{{max-width:1100px;margin:0 auto;padding:20px 16px 40px}}
 header{{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:16px}}
 h1{{font-size:20px;margin:0}}.sub{{color:var(--muted);font-size:12px}}
 .badge{{font-weight:700;font-size:11px;letter-spacing:.06em;padding:4px 9px;border-radius:999px;border:1px solid}}
 .paper{{color:var(--bid);border-color:var(--bid)}}.ok{{color:var(--pos);border-color:var(--pos)}}.warn{{color:var(--warn);border-color:var(--warn)}}.bad{{color:var(--neg);border-color:var(--neg)}}
-.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:16px}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr));gap:10px;margin-bottom:16px}}
 .kpi,.card,.panel{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}}
 .kpi-l,.lbl{{color:var(--muted);font-size:12px}}.kpi-v{{font-size:24px;font-weight:700;margin:2px 0;font-variant-numeric:tabular-nums}}.kpi-s{{color:var(--muted);font-size:11px}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-bottom:16px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr));gap:10px;margin-bottom:16px}}
 .card-h{{display:flex;gap:8px;justify-content:space-between;align-items:flex-start;margin-bottom:10px}}.q{{font-weight:600}}
 .pill{{font-size:10px;font-weight:700;padding:3px 7px;border-radius:6px;background:var(--line);white-space:nowrap}}
 .r-quiet{{color:var(--pos)}}.r-trending{{color:var(--warn)}}.r-event{{color:var(--neg)}}
@@ -390,9 +456,10 @@ ul.ev{{list-style:none;margin:0;padding:0;font-size:12px;max-height:260px;overfl
 th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}}th{{color:var(--muted);font-weight:600}}
 td.trunc{{max-width:260px;overflow:hidden;text-overflow:ellipsis}}.pos{{color:var(--pos)}}.neg{{color:var(--neg)}}.muted{{color:var(--muted)}}.empty{{text-align:center;color:var(--muted);padding:18px}}
 </style></head><body><div class="wrap">
-<header><div><h1>📈 Paper Market-Maker</h1><div class="sub">updated {time.strftime('%H:%M:%S UTC', time.gmtime(now))} · auto-refresh 15s · running {int(up // 60)}m · last feed event {f'{int(age)}s ago' if age is not None else '–'} · {st.requotes} requotes</div></div>
+<header><div><h1>📈 Paper Market-Maker</h1><div class="sub">updated {time.strftime('%H:%M:%S UTC', time.gmtime(now))} · auto-refreshing · running {int(up // 60)}m · last feed event {f'{int(age)}s ago' if age is not None else '–'} · {st.requotes} requotes</div></div>
 <div style="display:flex;gap:6px"><span class="badge paper">PAPER · NO REAL ORDERS</span><span class="badge {status_cls}">{status_txt}</span></div></header>
 <div class="kpis">{kpi_html}</div>
+{all_time_html(all_time_rows(Path(".")))}
 <div class="cards">{''.join(cards) or '<div class="card muted">No markets in config/markets.toml</div>'}</div>
 <div class="grid2">
  <div class="panel"><h2>Avg markout after fills</h2>{markout_chart(fills)}
@@ -412,6 +479,8 @@ def main() -> None:
     ap.add_argument("--out", default="my_tools/dashboard.html")
     ap.add_argument("--every", type=float, default=15.0)
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--snapshot-out", default="my_tools/dashboard_snapshot.html",
+                    help="copy without auto-refresh, for publishing as a page")
     a = ap.parse_args()
     root = Path(a.root)
     st = State()
@@ -424,6 +493,9 @@ def main() -> None:
         tmp = Path(a.out + ".tmp")
         tmp.write_text(page)
         tmp.replace(a.out)
+        if a.snapshot_out:
+            import re
+            Path(a.snapshot_out).write_text(re.sub(r'<meta http-equiv="refresh"[^>]*>', "", page))
         if a.once:
             break
         time.sleep(a.every)
