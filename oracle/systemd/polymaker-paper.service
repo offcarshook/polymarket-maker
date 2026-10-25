@@ -1,0 +1,16 @@
+[Unit]
+Description=polymaker market maker (PAPER ONLY)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@APP@
+# Paper test only: refuse to start if a private key was ever put in .env
+ExecStartPre=/bin/sh -c 'if grep -qE "^PK=.+" @APP@/.env; then echo "PK is set in .env - refusing (paper test only)"; exit 1; fi'
+ExecStart=@UV@ run polymaker run --paper
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

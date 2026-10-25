@@ -1,0 +1,13 @@
+[Unit]
+Description=polymaker dashboard writer (web/index.html every 15s)
+After=polymaker-paper.service
+
+[Service]
+User=@USER@
+WorkingDirectory=@APP@
+ExecStart=@APP@/.venv/bin/python -I my_tools/dashboard.py --out web/index.html
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

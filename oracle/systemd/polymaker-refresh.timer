@@ -1,0 +1,9 @@
+[Unit]
+Description=refresh the market list every 6 hours (markets expire)
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=6h
+
+[Install]
+WantedBy=timers.target

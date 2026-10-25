@@ -1,0 +1,54 @@
+diff --git a/src/polymaker/catalog/gamma.py b/src/polymaker/catalog/gamma.py
+index 301290f..ad56dc3 100644
+--- a/src/polymaker/catalog/gamma.py
++++ b/src/polymaker/catalog/gamma.py
+@@ -45,18 +45,21 @@ class GammaClient:
+         out: dict[str, dict[str, Any]] = {}
+         if not condition_ids:
+             return out
+-        try:
+-            r = await self._client.get(
+-                "/markets",
+-                params={"condition_ids": ",".join(condition_ids), "limit": len(condition_ids) + 5},
+-            )
+-            r.raise_for_status()
+-            for m in r.json():
+-                cid = m.get("conditionId")
+-                if cid:
+-                    out[cid] = m
+-        except (httpx.HTTPError, ValueError, KeyError) as exc:
+-            log.warning("markets_by_condition_failed", err=str(exc))
++        # chunked: hundreds of ids in one query string -> 414 Request-URI Too Large
++        for i in range(0, len(condition_ids), 50):
++            chunk = condition_ids[i : i + 50]
++            try:
++                r = await self._client.get(
++                    "/markets",
++                    params={"condition_ids": ",".join(chunk), "limit": len(chunk) + 5},
++                )
++                r.raise_for_status()
++                for m in r.json():
++                    cid = m.get("conditionId")
++                    if cid:
++                        out[cid] = m
++            except (httpx.HTTPError, ValueError, KeyError) as exc:
++                log.warning("markets_by_condition_failed", err=str(exc))
+         return out
+ 
+     async def resolve_tag_id(self, slug: str) -> str | None:
+diff --git a/src/polymaker/marketdata/service.py b/src/polymaker/marketdata/service.py
+index 9ffd17a..d31de91 100644
+--- a/src/polymaker/marketdata/service.py
++++ b/src/polymaker/marketdata/service.py
+@@ -114,7 +114,10 @@ class MarketDataService:
+         # ping_timeout matters: with None a half-dead TCP connection hangs
+         # forever. The server answers protocol pings (verified live), so a
+         # missing pong within 10s means the link is dead -> reconnect.
+-        kwargs: dict[str, Any] = {"ping_interval": 5, "ping_timeout": 10, "open_timeout": 10}
++        # max_size: the initial book snapshot for hundreds of markets arrives as one
++        # frame and can exceed websockets' 1 MiB default (close code 1009).
++        kwargs: dict[str, Any] = {"ping_interval": 5, "ping_timeout": 10, "open_timeout": 10,
++                                  "max_size": 64 * 2**20}
+         if self._proxy:
+             kwargs["proxy"] = self._proxy
+         async with websockets.connect(self._url, **kwargs) as ws:

@@ -1,0 +1,12 @@
+[Unit]
+Description=keep journal/paper.jsonl under 1 GB
+
+[Service]
+User=@USER@
+WorkingDirectory=@APP@
+ExecStart=@APP@/my_tools/journal_guard.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

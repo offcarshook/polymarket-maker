@@ -1,0 +1,13 @@
+[Unit]
+Description=polymaker paper fill simulator + markout logger
+After=polymaker-paper.service
+
+[Service]
+User=@USER@
+WorkingDirectory=@APP@
+ExecStart=@APP@/.venv/bin/python -I my_tools/markout.py --follow --from-end
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

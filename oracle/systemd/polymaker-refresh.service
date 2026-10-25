@@ -1,0 +1,10 @@
+[Unit]
+Description=rescan markets, re-pick, restart the paper bot
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@APP@
+ExecStart=@UV@ run python my_tools/scan_tags.py
+ExecStart=@APP@/.venv/bin/python -I my_tools/pick_markets.py --n 100000 --min-hours-left 48 --max-spread-ticks 3
+ExecStartPost=+/bin/systemctl restart polymaker-paper.service
