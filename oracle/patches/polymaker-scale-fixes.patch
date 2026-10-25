@@ -36,6 +36,64 @@ index 301290f..ad56dc3 100644
          return out
  
      async def resolve_tag_id(self, slug: str) -> str | None:
+diff --git a/src/polymaker/engine.py b/src/polymaker/engine.py
+index 12a105d..97b583d 100644
+--- a/src/polymaker/engine.py
++++ b/src/polymaker/engine.py
+@@ -279,6 +279,8 @@ class Engine:
+         cid = self._token_cid.get(tp.asset_id)
+         if cid is None:
+             return
++        if self.paper:
++            self._paper_fill(cid, tp)
+         p = self.profiles[cid]
+         self.est[cid].flow.update(tp.aggressor, tp.size, tp.ts)
+         # A trade only flags a SWEEP (-> pull quotes) if it's genuinely toxic:
+@@ -304,6 +306,35 @@ class Engine:
+         if consumed > 0 and tp.size >= p.event_sweep_frac * consumed:
+             self._sweep[cid] = True
+ 
++    def _paper_fill(self, cid: str, tp: TradePrint) -> None:
++        """PAPER ONLY: simulate maker fills from public trade prints so inventory,
++        position caps, inventory skew and the toxicity estimator behave like live
++        (without this, paper mode never sees a fill and always believes it is flat).
++        Conservative rule: a resting order fills only when a print trades strictly
++        through its price; touching it doesn't count (no queue model)."""
++        remaining = tp.size
++        orders = sorted(self.state.orders_for(tp.asset_id), key=lambda o: o.price,
++                        reverse=True)
++        for o in orders:
++            if remaining <= 0:
++                break
++            through = tp.price < o.price if o.side is Side.BUY else tp.price > o.price
++            if not through or o.size <= 0:
++                continue
++            take = min(remaining, o.size)
++            remaining -= take
++            fill = Fill(o.token_id, o.side, o.price, take,
++                        trade_id=f"paper-{o.order_id}-{int(tp.ts * 1000)}", ts=tp.ts)
++            if self.state.apply_fill(fill):
++                self._on_fill(fill)
++                log.info("paper_fill", cid=cid[:8], side=o.side.value, price=o.price,
++                         size=round(take, 2), print_px=tp.price)
++            o.size -= take
++            if o.size <= 1e-9:
++                self.state.remove_order(o.order_id)
++        if remaining < tp.size:
++            self._dirty[cid].set()  # requote with the new inventory
++
+     def _on_fill(self, fill: Fill) -> None:
+         self.risk.note_fill(fill)
+         cid = self._token_cid.get(fill.token_id)
+@@ -629,6 +660,8 @@ class Engine:
+         authoritative (it's what the exchange settles), so we correct to it —
+         but only for tokens with no in-flight trades (optimistic state is newer).
+         """
++        if self.gateway.funder == "0xPAPER":
++            return  # wallet-less paper run: inventory is simulated, no on-chain truth to correct to
+         tokens = [t for t in self._token_cid if self.state.inflight(t) == 0]
+         onchain = await self.gateway.token_balances(tokens)
+         if not onchain:
 diff --git a/src/polymaker/marketdata/service.py b/src/polymaker/marketdata/service.py
 index 9ffd17a..d31de91 100644
 --- a/src/polymaker/marketdata/service.py

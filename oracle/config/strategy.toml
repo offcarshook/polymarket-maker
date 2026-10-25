@@ -123,16 +123,16 @@ merge_min_size      = 20.0
 [profiles.paper-aggressive]
 micro_levels        = 3
 flow_ewma_halflife_s = 60
-gamma               = 0.3     # lean less, carry more inventory
+gamma               = 0.6   # lean harder to dump inventory (now that paper fills update it)
 delta_min_ticks     = 1       # quote right at the touch
 c_vol               = 0.8
 c_tox               = 2.5   # widen hard when recent fills got picked off (was 1.0)
 vol_short_halflife_s = 10
 vol_long_halflife_s  = 900
-base_size_usdc      = 500.0   # $500 per side
-q_max_usdc          = 3000.0  # net position cap $3k
-q_soft_frac         = 0.8
-layers              = 3       # 3 stacked orders per side
+base_size_usdc      = 150.0 # $150 per side (was 500: one news fill = -$23)
+q_max_usdc          = 600.0 # net cap per market $600 (was 3000)
+q_soft_frac         = 0.5   # stop adding at $300 net
+layers              = 2     # 2 orders per side (was 3)
 reward_size_mult    = 1.0
 layer_step_ticks    = 1
 reprice_ticks       = 1

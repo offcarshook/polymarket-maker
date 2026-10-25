@@ -9,7 +9,7 @@
 #
 # What it does:
 #   * installs git/curl + uv (Python manager)
-#   * clones warproxxx/poly-maker at the reviewed commit, applies our 2 scale fixes
+#   * clones warproxxx/poly-maker at the reviewed commit, applies our fixes (scale + paper fills)
 #   * copies our configs + my_tools, creates an EMPTY .env (paper mode needs no key)
 #   * scans ~11k markets, picks the eligible ones, starts 5 systemd services
 # It NEVER asks for or stores a private key, and the bot service refuses to start
@@ -22,10 +22,10 @@ REVIEWED_COMMIT="4f32103591c9582ccd012bdf10f77d86e5879444"
 RUN_USER="$(id -un)"
 MODE="${MODE:-full}"
 if [ "$MODE" = "lite" ]; then
-  PICK_ARGS="--n 300 --min-hours-left 336 --max-spread-ticks 3"
+  PICK_ARGS="--n 300 --min-hours-left 336 --max-spread-ticks 3 --no-games"
   MAX_MB=200; DASH_EVERY=30; CPUQUOTA=50%; MEMMAX=700M
 else
-  PICK_ARGS="--n 100000 --min-hours-left 48 --max-spread-ticks 3"
+  PICK_ARGS="--n 100000 --min-hours-left 48 --max-spread-ticks 3 --no-games"
   MAX_MB=1000; DASH_EVERY=15; CPUQUOTA=200%; MEMMAX=2G
 fi
 
@@ -55,9 +55,9 @@ cd "$APP"
 git checkout -q "$REVIEWED_COMMIT" 2>/dev/null || { git fetch -q origin && git checkout -q "$REVIEWED_COMMIT"; }
 if git apply --check "$KIT/patches/polymaker-scale-fixes.patch" 2>/dev/null; then
   git apply "$KIT/patches/polymaker-scale-fixes.patch"
-  echo "applied scale fixes (414 chunking + websocket max_size)"
+  echo "applied fixes (414 chunking, websocket max_size, in-engine paper fills)"
 else
-  echo "scale fixes already applied"
+  echo "fixes already applied"
 fi
 
 say "4/7 configs, tools, empty .env"

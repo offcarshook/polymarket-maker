@@ -12,8 +12,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
+
+
+# single games / short in-play markets: whoever watches the game or the spot feed
+# sees the move before we can requote -> they were our biggest paper losses
+GAME_RE = re.compile(r"\bvs\.?\b|\bv\.\s|O/U|Over/Under|Spread|Handicap|Up or Down|"
+                     r"\bMap \d|\bGame \d|\bSet \d|\bRound \d|Total (Kills|Goals|Points)", re.I)
 
 
 def main() -> None:
@@ -27,6 +34,8 @@ def main() -> None:
                     help="skip books wider than this many ticks (0 = no limit); wide = stale/toxic")
     ap.add_argument("--exclude", action="append", default=[],
                     help="skip slugs containing this text (repeatable), e.g. events resolving today")
+    ap.add_argument("--no-games", action="store_true",
+                    help="skip single games / in-play style markets (X vs Y, O/U, spreads, up-or-down)")
     ap.add_argument("--db", default="state.db")
     ap.add_argument("--out", default="config/markets.toml")
     a = ap.parse_args()
@@ -54,6 +63,8 @@ def main() -> None:
             if left is not None and 0 < left < a.min_hours_left:
                 continue
         if len(m.get("tokens", [])) != 2 or any(x in slug for x in a.exclude):
+            continue
+        if a.no_games and GAME_RE.search(str(m.get("question", ""))):
             continue
         tick_sz = float(m.get("tick_size") or 0.01)
         if a.max_spread_ticks and (ba - bb) > a.max_spread_ticks * tick_sz + 1e-9:
